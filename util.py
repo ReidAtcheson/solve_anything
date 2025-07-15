@@ -136,7 +136,7 @@ def rayleigh_ritz(A,V):
     return W,eigs
 
 def best_converged(A,W,eigs):
-    residuals = [np.linalg.norm(A.matvec(W[:,i]) - eigs[i]*W[:,i]) for i in range(W.shape[1])]
+    residuals = [np.linalg.norm(A.matvec(W[:,i]) - eigs[i]*W[:,i])/np.abs(eigs[i]) for i in range(W.shape[1])]
     i = np.argmin(residuals)
     return W[:,i],eigs[i],residuals[i]
 
@@ -155,6 +155,8 @@ def smallest_eigenpairs(A: spla.LinearOperator, v: np.ndarray, k: int) -> tuple[
     def solveA(b):
         nonlocal minres_its
         b=b.reshape(-1,1)
+        if converged>0:
+            b=b-P[:,:converged]@(P[:,:converged].T@b)
         #Determined this empirically. Seems to "mostly work"
         maxiter=2*b.shape[0]
         tol=1e-32
@@ -162,7 +164,10 @@ def smallest_eigenpairs(A: spla.LinearOperator, v: np.ndarray, k: int) -> tuple[
         def callback(xk):
             nonlocal minres_its
             minres_its+=1
-        x,_ = spla.minres(A,b,maxiter=maxiter,rtol=tol,callback=callback)
+
+        def evalA(y):
+            return A@y
+        x,_ = spla.minres(spla.LinearOperator((m,m),matvec=evalA),b,maxiter=maxiter,rtol=tol,callback=callback)
         return x
 
     invA = spla.LinearOperator((m,m),matvec=solveA)
@@ -172,19 +177,19 @@ def smallest_eigenpairs(A: spla.LinearOperator, v: np.ndarray, k: int) -> tuple[
 
     it=0
     while converged<k:
-        if converged>0:
-            V = V - P[:,:converged] @ (P[:,:converged].T @ V)
-            V,_ = la.qr(V,mode="economic")
         W,eigs = rayleigh_ritz(spla.aslinearoperator(A),V)
         w,e,best_residual=best_converged(spla.aslinearoperator(A),W,eigs)
         #New starting vector for arnoldi
-        v = np.sum(W,axis=1)
+        es = np.zeros(eigs.size)
+        es[np.abs(eigs)<=np.median(np.abs(eigs))]=1.0
+        v=W@es
         logger.info("it=%s, Current eigenvalue: %s, current best residual: %s, converged: %s. minres_its: %s",it,e,best_residual,converged,minres_its)
         it+=1
-        if best_residual<1e-9:
+        if best_residual<1e-5:
             P[:,converged] = w
             converged+=1
             #Re-orthogonalize
+            P[:,:converged],_ = rayleigh_ritz(spla.aslinearoperator(A),P[:,:converged])
             P[:,:converged],_ = la.qr(P[:,:converged],mode="economic")
             if converged==k:
                 break

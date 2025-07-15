@@ -12,8 +12,8 @@ import matplotlib.pyplot as plt
 seed=23439287
 rng=np.random.default_rng(seed)
 
-m=5000
-k=50
+m=2500
+k=20
 bands=[1,2,32]
 A=sp.diags([rng.uniform(-1,1,size=m) for _ in bands],bands,shape=(m,m))
 A=A.tocsr()
