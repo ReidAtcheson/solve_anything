@@ -209,6 +209,51 @@ def smallest_eigenpairs(A: spla.LinearOperator, v: np.ndarray, k: int) -> tuple[
 
 
 
+#Simple qr/power iteration approach
+def smallest_eigenpairs_power(A: spla.LinearOperator, k: int) -> tuple[np.ndarray, np.ndarray]:
+    rng=np.random.default_rng(42)
+    m,n=A.shape
+    assert m==n
+    converged=0
+    V = rng.uniform(-1,1,size=(m,2*k))
+    V,_ = la.qr(V,mode="economic")
+
+
+    minres_its=0
+    def solveA(b):
+        nonlocal minres_its
+        b=b.reshape(-1,1)
+        maxiter=2*b.shape[0]
+        tol=1e-32
+
+        def callback(xk):
+            nonlocal minres_its
+            minres_its+=1
+
+        def evalA(y):
+            return A@y
+        x,_ = spla.minres(spla.LinearOperator((m,m),matvec=evalA),b,maxiter=maxiter,rtol=tol,callback=callback)
+        return x
+
+
+    P,eigs = rayleigh_ritz(spla.aslinearoperator(A),V)
+    residuals = np.array([np.linalg.norm(A@P[:,i]-eigs[i]*P[:,i])/abs(eigs[i]) for i in range(P.shape[1])])
+    ids = np.argsort(np.abs(eigs))
+
+    while np.amax(residuals[ids[:k]])>1e-6:
+        logging.info("best residual: %s, worst residual %s, best eig %s, worst eig %s, minres iters %s",np.amin(residuals[ids[:k]]),np.amax(residuals[ids[:k]]),eigs[ids[0]],eigs[ids[k-1]],minres_its)
+
+        for i in range(V.shape[1]):
+            V[:,i]=solveA(V[:,i])
+        V,_ = la.qr(V,mode="economic")
+        P,eigs = rayleigh_ritz(spla.aslinearoperator(A),V)
+        residuals = np.array([np.linalg.norm(A@P[:,i]-eigs[i]*P[:,i])/abs(eigs[i]) for i in range(P.shape[1])])
+        ids = np.argsort(np.abs(eigs))
+
+    return P[:,ids[0:k]],eigs[ids[0:k]]
+
+
+
 
 
 

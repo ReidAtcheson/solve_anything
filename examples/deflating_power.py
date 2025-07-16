@@ -13,7 +13,7 @@ seed=23439287
 rng=np.random.default_rng(seed)
 
 m=1001
-k=40
+k=20
 bands=[1,2,32]
 A=sp.diags([rng.uniform(-1,1,size=m) for _ in bands],bands,shape=(m,m))
 A=A.tocsr()
@@ -23,13 +23,13 @@ print(f"nnz(lu(A)) = {luA.L.nnz+luA.U.nnz}, nnz(defl(A)) = {m*k}")
 
 e=np.ones(m)
 d=A@e
-alpha=0.8
-A = A + alpha*sp.diags([d],[0],shape=(m,m))
+alpha=0.9999
+A = A - alpha*sp.diags([d],[0],shape=(m,m))
 
 
 v=rng.uniform(-1,1,size=m)
 
-V,eigs = util.smallest_eigenpairs(A,v,k)
+V,eigs = util.smallest_eigenpairs_power(A,k)
 print(np.amin(np.abs(eigs)))
 
 
@@ -47,11 +47,11 @@ def defl_callback(xk):
     defl_err.append(np.linalg.norm(x-xk))
 
 
-spla.minres(A,b,callback=minres_callback,maxiter=2*A.shape[0],rtol=1e-32)
+spla.minres(A,b,callback=minres_callback,maxiter=10*A.shape[0],rtol=1e-32)
 
 
 defl = util.DeflatedMinres(A,V)
-defl.solve(b,callback=defl_callback,maxiter=2*A.shape[0],tol=1e-32)
+defl.solve(b,callback=defl_callback,maxiter=10*A.shape[0],tol=1e-32)
 
 
 plt.semilogy(minres_err,label="minres")
