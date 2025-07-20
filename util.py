@@ -25,6 +25,82 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)  
 
 
+import numpy as np
+import scipy.sparse as sp
+
+
+class CountingLinearOperator(spla.LinearOperator):
+    """
+    A LinearOperator wrapper for a sparse matrix that counts matvec calls.
+    """
+    def __init__(self, A: sp.spmatrix):
+        """
+        Parameters
+        ----------
+        A : scipy.sparse.spmatrix
+            The sparse matrix to wrap.
+        """
+        # Ensure CSR for efficient multiplication
+        self.A = A.tocsr()
+        # Counter for matvec calls
+        self._counter = 0
+        # Initialize the base LinearOperator
+        super().__init__(dtype=A.dtype, shape=A.shape)
+
+    def _matvec(self, x: np.ndarray) -> np.ndarray:
+        """
+        Perform A @ x and increment the counter.
+        """
+        self._counter += 1
+        return self.A.dot(x)
+
+    def _rmatvec(self, x: np.ndarray) -> np.ndarray:
+        """
+        Optionally handle transpose multiplications and count them separately.
+        """
+        # You could track these separately if desired
+        return self.A.T.dot(x)
+
+    def get_counter(self) -> int:
+        """
+        Retrieve the number of times matvec has been called.
+        """
+        return self._counter
+
+def graph_laplacian(A: sp.spmatrix) -> sp.spmatrix:
+    """
+    Compute the (combinatorial) graph Laplacian L for a directed or undirected graph,
+    using out‐degrees on the diagonal and -1 for each edge.
+    
+    Parameters
+    ----------
+    A : scipy.sparse.spmatrix
+        Square adjacency matrix.  Any nonzero entry is treated as an edge of weight 1.
+    
+    Returns
+    -------
+    L : scipy.sparse.csr_matrix
+        The unweighted graph Laplacian L = D_out - B, where B is the binary adjacency.
+    """
+    # Ensure CSR for efficient row‐ops
+    A = A.tocsr()
+    
+    # Binarize: any nonzero entry → 1
+    B = A.copy()
+    B.data[:] = 1
+    
+    # Out‐degree = sum of each row of B
+    deg = np.array(B.sum(axis=1)).ravel()
+    
+    # Build D_out
+    D = sp.diags(deg)
+    
+    # Laplacian L = D - B
+    L = D - B
+    
+    return L.tocsr()
+
+
 class DeflatedMinres:
     """Solve ``Ax=b`` using deflated MINRES.
 
@@ -255,19 +331,166 @@ def smallest_eigenpairs_power(A: spla.LinearOperator, k: int) -> tuple[np.ndarra
 
 
 
+# inverse iteration on (A-sigma*I).
+# Keep p vectors and iterate until k eigenvalues 
+# have converged. Optionally Keep K projected out
+# Assume A is symmetric
+def shifted_inverse_power(A,sigma,k,p,K,rtol):
+    rng=np.random.default_rng(42)
+    m,n=A.shape
+    assert m==n
+    assert p>=k
+    V = rng.uniform(-1,1,size=(m,p))
+    V,_ = la.qr(V,mode="economic")
+
+    def solveA(b):
+        if K is not None:
+            b = b - K @ (K.T @ b)
+        b=b.reshape(-1,1)
+        maxiter=b.size
+        tol=1e-32
+
+        def evalA(y):
+            return A@y - sigma*y
+        x,_ = spla.minres(spla.LinearOperator((m,m),matvec=evalA),b,maxiter=maxiter,rtol=tol)
+        return x
+    P,eigs = rayleigh_ritz(spla.aslinearoperator(A),V)
+    residuals = np.array([np.linalg.norm(A@P[:,i]-eigs[i]*P[:,i])/abs(eigs[i]) for i in range(P.shape[1])])
+    ids = np.argsort(residuals)
+    worst = np.amax(residuals[ids[0:k]])
+
+    while worst > rtol:
+        logger.info("shift: %s. worst residual %s",sigma,worst)
+        worst = np.amax(residuals[ids[0:k]])
+        for i in range(V.shape[1]):
+            V[:,i]=solveA(V[:,i])
+        V,_ = la.qr(V,mode="economic")
+        P,eigs = rayleigh_ritz(spla.aslinearoperator(A),V)
+        residuals = np.array([np.linalg.norm(A@P[:,i]-eigs[i]*P[:,i])/abs(eigs[i]) for i in range(P.shape[1])])
+        ids = np.argsort(residuals)
+        worst = np.amax(residuals[ids[0:k]])
+        V = P
+
+    return P[:,ids[0:k]],eigs[ids[0:k]]
 
 
 
 
 
+# Iteratively apply shifted_inverse_power
+# with successively increasing shifts expanding
+# around 0 until reached desired number of eigenvectors
+def spectrum_near_zero(A,k,rtol=2e-12,p=2):
+    assert k>=p
+    V,eigs = shifted_inverse_power(A,0.0,p,k,None,rtol)
+
+    while eigs.size<k:
+        ids=np.argsort(eigs)
+        eigs = eigs[ids]
+        V = V[:,ids]
+        logger.info("eigs = %s",eigs)
+        ipos = sum(eigs>0)
+        ineg = sum(eigs<0)
+        #decide whether to use positive or negative shift
+        shift = 0.0
+        if ipos>ineg and ineg>0:
+            shift = eigs[0]
+        if ineg > ipos and ipos>0:
+            shift = eigs[eigs.size-1]
+        if ipos==ineg:
+            shift = eigs[0]
+
+        W,neigs = shifted_inverse_power(A,shift,p,k,V,rtol=rtol)
+        V = np.concatenate((V,W),axis=1)
+        eigs = np.concatenate((eigs,neigs))
+    ids=np.argsort(eigs)
+    eigs = eigs[ids]
+    V = V[:,ids]
+    return V,eigs
 
 
 
 
 
+#Warm up fiedler calculation with a fixed number of power iterations
+#on shifted graph laplacian and follow up with some number of inverse iterations
+def fiedler(A,k,outer,npower):
+    assert k>=2
+    rng=np.random.default_rng(42)
+    L = graph_laplacian(A)
+    m,_ = L.shape
+    normL = spla.norm(L,ord=1)
+    #Will use power iteration on this. smallest eigenvalues
+    #of L become largest eigenvalues for L-norm(L)*I
+    shiftL = L - normL*sp.eye(m)
+    nevals=0
+    V=rng.uniform(-1,1,size=(m,k))
+    V,_ = la.qr(V,mode="economic")    
+    eigs = None
+    v = None
+    u = np.ones((m,1))/np.sqrt(m)
+    for i in range(outer):
+        for _ in range(npower):
+            #Project out nullspace
+            V = V - u @ (u.T @ V)
+            V = shiftL@V
+            V,_ = la.qr(V,mode="economic")
+            nevals+=k
+        V,eigs = rayleigh_ritz(spla.aslinearoperator(L),V)
+        ids = np.argsort(eigs)
+        V = V[:,ids]
+        eigs = eigs[ids]
+
+        cL = CountingLinearOperator(L - eigs[0]*sp.eye(m))
+        #Polynomially precondition the approximate fiedler vector
+        for j in range(k):
+            V[:,j],_ = spla.minres(cL,V[:,j] - u@(u.T@V[:,j]),maxiter=100)
+        #This is just convenient but we can probably find a way to 
+        #avoid this second orthgonalization and rayleigh-ritz projection
+        V,_ = la.qr(V,mode="economic")
+        V,eigs = rayleigh_ritz(spla.aslinearoperator(L),V)
+        ids = np.argsort(eigs)
+        V = V[:,ids]
+        eigs = eigs[ids]
+
+
+        nevals+=k+cL.get_counter()
+
+        l = eigs[0]
+        v = V[:,0]
+
+
+        relres = np.linalg.norm(L@v - l*v)/np.abs(l)
+        logger.info("Shifted power warmup phase iter: %s, fiedler eig: %s, relres: %s, laplacian evals: %s CG iters: %s",i,l,relres,nevals,cL.get_counter())
 
 
 
+#Warm up fiedler calculation with a fixed number of power iterations
+#on shifted graph laplacian and follow up with some number of inverse iterations
+def fiedler_lanczos(A,k):
+    assert k>=2
+    rng=np.random.default_rng(42)
+    L = graph_laplacian(A)
+    m,_ = L.shape
+    normL = spla.norm(L,ord=1)
+    v=rng.uniform(-1,1,size=(m,1))
+    #p=np.ones((m,1))/np.sqrt(m)
+    #v = v - p @ (p.T @ v)
+    cL = CountingLinearOperator(L)
+    #v,_ = spla.cg(cL,v)
+    #v = v - p @ (p.T @ v)
+    cshiftL = CountingLinearOperator(L-normL*sp.eye(m))
+    eigs,V = spla.eigsh(cshiftL,v0=v,k=2,ncv=k,tol=1e-6)
+    V,_ = la.qr(V,mode="economic")
+    V,eigs = rayleigh_ritz(spla.aslinearoperator(L),V)
+    ids=np.argsort(eigs)
+    eigs=eigs[ids]
+    V=V[:,ids]
 
+    l=eigs[1]
+    v=V[:,1]
+    relres = np.linalg.norm(L@v - l*v)/l
+    logger.info("CG warmup evals %s lanczos evals %s. eig %s, relres %s",cL.get_counter(),cshiftL.get_counter(),l,relres)
+    return v
 
 
